@@ -10,10 +10,7 @@ import statistics
 import time
 from pathlib import Path
 
-from semif_phase1.core import load_causal_model
-from semif_phase1.direct import score
-from semif_phase1.serial import SerialPrefixScorer
-from semif_phase1.shared import score_shared
+import backends
 
 
 def main() -> None:
@@ -23,17 +20,20 @@ def main() -> None:
     parser.add_argument("--input", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--max-tokens", type=int, default=4096)
+    backends.add_arguments(parser)
     args = parser.parse_args()
     if args.output.exists():
         parser.error("Output must be new")
+    backends.validate(parser, args)
     rows = [json.loads(line) for line in args.input.read_text().splitlines() if line.strip()]
     groups = defaultdict(list)
     for row in rows:
         groups[row["group_id"]].append(row)
     if len(rows) != 777 or len(groups) != 37 or any(len(group) != 21 for group in groups.values()):
         parser.error("Expected the committed 37-state x 21-question fixture")
-    model, tokenizer, metadata = load_causal_model(args.model, args.revision)
-    import torch
+    api = backends.load(args, args.max_tokens)
+    model, tokenizer, metadata = api.model, api.tokenizer, api.metadata
+    score, SerialPrefixScorer, score_shared = api.score, api.SerialPrefixScorer, api.score_shared
 
     first = next(iter(groups.values()))
     score(model, tokenizer, first[0], metadata, args.max_tokens)
@@ -45,13 +45,13 @@ def main() -> None:
         "version": "shape777-published-v1",
         "input_sha256": hashlib.sha256(args.input.read_bytes()).hexdigest(),
         "model": metadata,
-        "hardware": torch.cuda.get_device_name(0),
+        "hardware": api.hardware,
         "timing_scope": "Warm model; includes prompt construction, tokenization, transfers, forward passes and CPU readout.",
         "results": [],
     }
     predictions = {}
     for mode in ("fresh", "serial_prefix", "parallel_shared"):
-        torch.cuda.reset_peak_memory_stats()
+        api.reset_peak()
         started = time.perf_counter()
         values, state_times = [], []
         for group in groups.values():
@@ -73,7 +73,7 @@ def main() -> None:
                 "wall_seconds": elapsed,
                 "decisions_per_second": len(values) / elapsed,
                 "state_p50_seconds": statistics.median(state_times),
-                "peak_cuda_bytes": torch.cuda.max_memory_allocated(),
+                api.peak_key: api.peak(),
             }
         )
     reference = {row["id"]: row for row in predictions["fresh"]}

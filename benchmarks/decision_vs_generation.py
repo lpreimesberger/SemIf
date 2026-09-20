@@ -9,8 +9,7 @@ import statistics
 import time
 from pathlib import Path
 
-from semif_phase1.core import load_causal_model
-from semif_phase1.shared import score_shared
+import backends
 
 
 class TimelineStreamer:
@@ -57,6 +56,52 @@ def compact_messages(state: str, rows: list[dict]) -> list[dict]:
     ]
 
 
+def _finish(prompt, rows, tokenizer, input_tokens, generated, events, total) -> dict:
+    text = tokenizer.decode(generated, skip_special_tokens=True)
+    parsed = None
+    try:
+        candidate = json.loads(text)
+        if (
+            isinstance(candidate, list)
+            and len(candidate) == len(rows)
+            and all(choice in {"yes", "no"} for choice in candidate)
+        ):
+            parsed = candidate
+    except json.JSONDecodeError:
+        pass
+    return {
+        "prompt_sha256": hashlib.sha256(prompt.encode()).hexdigest(),
+        "input_tokens": input_tokens,
+        "output_tokens": len(generated),
+        "time_to_first_token_seconds": events[0]["seconds"] if events else None,
+        "total_seconds": total,
+        "output_text": text,
+        "valid_complete_array": parsed is not None,
+        "choices": parsed,
+        "timeline": events,
+    }
+
+
+def run_generation_llamacpp(llm, tokenizer, state: str, rows: list[dict], max_new_tokens: int) -> dict:
+    """Greedy generation through llama.cpp, timed token by token like the Torch streamer."""
+    started = time.perf_counter()
+    prompt = tokenizer.apply_chat_template(
+        compact_messages(state, rows), tokenize=False, add_generation_prompt=True, enable_thinking=False)
+    ids = llm.tokenize(prompt.encode(), add_bos=False, special=True)
+    if ids != tokenizer.encode(prompt, add_special_tokens=False):
+        raise ValueError("GGUF tokenization differs from the source tokenizer")
+    stops = {tokenizer.eos_token_id, llm.token_eos()}
+    generated, events = [], []
+    for token in llm.generate(ids, temp=0.0, reset=True):
+        elapsed = time.perf_counter() - started
+        generated.append(int(token))
+        events.append({"seconds": elapsed, "token_id": int(token),
+                       "text": tokenizer.decode([int(token)], skip_special_tokens=False)})
+        if int(token) in stops or len(generated) >= max_new_tokens:
+            break
+    return _finish(prompt, rows, tokenizer, len(ids), generated, events, time.perf_counter() - started)
+
+
 def run_generation(model, tokenizer, state: str, rows: list[dict], max_new_tokens: int) -> dict:
     import torch
 
@@ -82,29 +127,7 @@ def run_generation(model, tokenizer, state: str, rows: list[dict], max_new_token
         torch.cuda.synchronize()
     total = time.perf_counter() - started
     generated = output[0, input_tokens:].detach().cpu().tolist()
-    text = tokenizer.decode(generated, skip_special_tokens=True)
-    parsed = None
-    try:
-        candidate = json.loads(text)
-        if (
-            isinstance(candidate, list)
-            and len(candidate) == len(rows)
-            and all(choice in {"yes", "no"} for choice in candidate)
-        ):
-            parsed = candidate
-    except json.JSONDecodeError:
-        pass
-    return {
-        "prompt_sha256": hashlib.sha256(prompt.encode()).hexdigest(),
-        "input_tokens": input_tokens,
-        "output_tokens": len(generated),
-        "time_to_first_token_seconds": streamer.events[0]["seconds"] if streamer.events else None,
-        "total_seconds": total,
-        "output_text": text,
-        "valid_complete_array": parsed is not None,
-        "choices": parsed,
-        "timeline": streamer.events,
-    }
+    return _finish(prompt, rows, tokenizer, input_tokens, generated, streamer.events, total)
 
 
 def main() -> None:
@@ -115,34 +138,37 @@ def main() -> None:
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--repeats", type=int, default=3)
     parser.add_argument("--max-new-tokens", type=int, default=128)
+    backends.add_arguments(parser)
     args = parser.parse_args()
     if args.output.exists() or args.repeats < 1 or args.max_new_tokens < 1:
         parser.error("Output must be new and numeric limits must be positive")
+    backends.validate(parser, args)
     rows = [json.loads(line) for line in args.input.read_text().splitlines() if line.strip()][:21]
     if len(rows) != 21 or len({row["state"] for row in rows}) != 1:
         parser.error("Input must begin with one complete 21-question shared-state group")
 
-    model, tokenizer, metadata = load_causal_model(args.model, args.revision)
-    import torch
+    api = backends.load(args)
+    model, tokenizer, metadata, score_shared = api.model, api.tokenizer, api.metadata, api.score_shared
+    generate = run_generation_llamacpp if api.name == "llamacpp" else run_generation
 
     # Warm both paths; warmup is excluded from every reported duration.
     score_shared(model, tokenizer, rows, metadata)
-    warmup = run_generation(model, tokenizer, rows[0]["state"], rows[:1], 16)
+    warmup = generate(model, tokenizer, rows[0]["state"], rows[:1], 16)
     if not warmup["timeline"]:
         raise RuntimeError("Generation warmup emitted no token events")
 
     direct_runs = []
     direct_outputs = None
     for _ in range(args.repeats):
-        torch.cuda.reset_peak_memory_stats()
+        api.reset_peak()
         direct_outputs, timing = score_shared(model, tokenizer, rows, metadata)
-        direct_runs.append({**timing, "peak_cuda_bytes": torch.cuda.max_memory_allocated()})
+        direct_runs.append({**timing, api.peak_key: api.peak()})
 
     generation_runs = []
     for _ in range(args.repeats):
-        torch.cuda.reset_peak_memory_stats()
-        run = run_generation(model, tokenizer, rows[0]["state"], rows, args.max_new_tokens)
-        run["peak_cuda_bytes"] = torch.cuda.max_memory_allocated()
+        api.reset_peak()
+        run = generate(model, tokenizer, rows[0]["state"], rows, args.max_new_tokens)
+        run[api.peak_key] = api.peak()
         generation_runs.append(run)
 
     direct_choices = [
@@ -156,7 +182,7 @@ def main() -> None:
     report = {
         "version": "decision-vs-compact-generation-v2",
         "model": metadata,
-        "hardware": torch.cuda.get_device_name(0),
+        "hardware": api.hardware,
         "input": {
             "path": str(args.input),
             "sha256": hashlib.sha256(args.input.read_bytes()).hexdigest(),

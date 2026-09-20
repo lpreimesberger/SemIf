@@ -12,6 +12,8 @@ CUDA_VISIBLE_DEVICES=0 python benchmarks/decision_vs_generation.py \
   --output compact-array-run.json
 ```
 
+On AMD or other non-CUDA GPUs, add `--backend llamacpp --gguf-file <file> --hardware-label <device>` and a GGUF `--model`/`--revision`; see [docs/LLAMACPP.md](../docs/LLAMACPP.md). `shape777.py` takes the same flags.
+
 This runs three warmed measurements of each path on the first 21-row shared-state group. The generated baseline requests only an ordered JSON array of `"yes"`/`"no"` strings. The committed run, including exact prompt messages and token timelines, is [decision-vs-compact-array.json](../results/raw/decision-vs-compact-array.json).
 
 ## Stability perturbations

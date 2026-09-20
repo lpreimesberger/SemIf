@@ -43,9 +43,10 @@ type, llama-cpp-python version, and offload settings.
 `--mode serial` and `--mode shared` snapshot llama.cpp state after the state
 prefix and restore it per question, because Qwen3.5's recurrent layers cannot be
 trimmed to an arbitrary position. Shared mode runs suffixes one after another
-rather than as a padded batch. Restoring state copies the whole context
-(`--max-tokens` sets `n_ctx`), so lower it for short prompts. Reranker mode is
-unsupported.
+rather than as a padded batch. Each restore copies the saved state (about
+112 MB for a 1,800-token Qwen3.5-4B prefix, roughly 0.1 s on Strix Halo) and its
+cost does not depend on `--max-tokens`. That restore, not the suffix forward
+pass, dominates reuse time. Reranker mode is unsupported.
 
 ## Measured on Strix Halo (Q4_K_M, Vulkan)
 
@@ -58,7 +59,44 @@ Quantization changes probabilities; these are not the BF16 headline numbers.
   direct on 21/21 (largest probability difference 0.039). Direct 23.9 s;
   serial 5.8 s; shared 5.8 s (1.9 s prefill, 1.9 s state restores).
 
+- All 777 decisions (`benchmarks/shape777.py`, 37 states x 21 questions):
+
+  | Mode | Wall time | Decisions/s |
+  |---|---:|---:|
+  | Fresh direct | 897 s | 0.87 |
+  | Serial prefix reuse | 213 s | 3.66 |
+  | Shared state | 209 s | 3.71 |
+
+  Serial and shared each changed 4 of 777 argmaxes relative to fresh (largest
+  probability difference 0.073). Shared is not meaningfully faster than serial
+  here because it also runs suffixes sequentially.
+- Compact generation baseline (`benchmarks/decision_vs_generation.py`): greedy
+  generation of the 21-value array took 3.1 s and was invalid in every run (the
+  Q4_K_M model wrote 20 values), against 5.7 s for shared direct scoring. The
+  README's speed advantage over generation, measured on CUDA with a batched
+  parallel path, does not carry over to this backend.
+
 These are single local runs, not committed evidence under `results/`.
+
+## Systems benchmarks
+
+`benchmarks/shape777.py` and `benchmarks/decision_vs_generation.py` accept the
+same backend flags. llama.cpp does not report a device name, so pass
+`--hardware-label`; memory is recorded as `peak_device_bytes: null` because
+llama.cpp exposes no peak-allocation counter comparable to CUDA's.
+
+```bash
+python benchmarks/shape777.py --backend llamacpp \
+  --model bartowski/Qwen_Qwen3.5-4B-GGUF \
+  --revision 4168f45a16a1290d65a4ec0fa312ae917a4c15d6 \
+  --gguf-file Qwen_Qwen3.5-4B-Q4_K_M.gguf \
+  --hardware-label "AMD Radeon 8060S (Strix Halo, Vulkan)" \
+  --input benchmarks/data/shape777.jsonl --output shape777-llamacpp.json
+```
+
+The generation comparison uses greedy llama.cpp generation. Quality evaluation
+needs no flags: score with `semif-score --backend llamacpp` and pass the
+predictions to `benchmarks/evaluate.py` as usual.
 
 ## Tests
 

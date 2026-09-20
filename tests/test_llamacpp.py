@@ -43,3 +43,40 @@ def test_direct_serial_and_shared_agree_on_real_gguf(tmp_path):
         assert max(range(2), key=c["probabilities"].__getitem__) == best
         assert b["option_logits"] == pytest.approx(a["option_logits"], abs=0.5)
         json.dumps(a, allow_nan=False)
+
+
+def _benchmark_helper():
+    import importlib.util
+
+    path = Path(__file__).resolve().parents[1] / "benchmarks" / "backends.py"
+    spec = importlib.util.spec_from_file_location("benchmark_backends", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+@pytest.mark.parametrize("argv,message", [
+    (["--backend", "llamacpp"], "--hardware-label is required"),
+    (["--gguf-file", "x.gguf"], "require --backend llamacpp"),
+    (["--backend", "llamacpp", "--hardware-label", "GPU", "--n-gpu-layers", "-2"], "must be -1 or nonnegative"),
+])
+def test_benchmark_backend_arguments_are_validated(argv, message, capsys):
+    import argparse
+
+    helper = _benchmark_helper()
+    parser = argparse.ArgumentParser()
+    helper.add_arguments(parser)
+    with pytest.raises(SystemExit):
+        helper.validate(parser, parser.parse_args(argv))
+    assert message in capsys.readouterr().err
+
+
+def test_benchmark_backend_defaults_to_torch():
+    import argparse
+
+    helper = _benchmark_helper()
+    parser = argparse.ArgumentParser()
+    helper.add_arguments(parser)
+    args = parser.parse_args([])
+    helper.validate(parser, args)
+    assert args.backend == "torch"
