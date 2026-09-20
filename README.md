@@ -35,6 +35,9 @@ This baseline reads typed option probabilities directly from a model. No answer 
 serial prefix reuse, and parallel shared-state decisions on macOS arm64.
 Install `pip install -e '.[test,mlx]'` and add `--backend mlx` to the scorer command.
 
+**AMD / non-CUDA GPUs:** use the [llama.cpp backend](docs/LLAMACPP.md) with a GGUF model
+(Vulkan, ROCm, or CPU) via `--backend llamacpp`.
+
 Python 3.10+, CUDA, and a GPU that can hold a 4B BF16 model:
 
 ```bash

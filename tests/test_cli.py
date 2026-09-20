@@ -7,6 +7,9 @@ from semif_phase1.cli import main
 
 @pytest.mark.parametrize("extra,message", [
     (["--backend", "mlx", "--mode", "reranker"], "reranker requires torch"),
+    (["--backend", "llamacpp", "--mode", "reranker"], "reranker requires torch"),
+    (["--mode", "direct", "--gguf-file", "x.gguf"], "requires --backend llamacpp"),
+    (["--mode", "direct", "--backend", "llamacpp", "--n-gpu-layers", "-2"], "must be -1 or nonnegative"),
     (["--mode", "direct", "--mlx-bits", "4"], "requires --backend mlx"),
     (["--mode", "direct", "--mlx-cache-limit-mib", "0"], "requires --backend mlx"),
     (["--mode", "direct", "--backend", "mlx", "--mlx-cache-limit-mib", "-1"], "must be nonnegative"),

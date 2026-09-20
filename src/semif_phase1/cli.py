@@ -16,7 +16,13 @@ from .shared import score_shared
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--mode", choices=("direct", "serial", "shared", "reranker"), required=True)
-    parser.add_argument("--backend", choices=("torch", "mlx"), default="torch")
+    parser.add_argument("--backend", choices=("torch", "mlx", "llamacpp"), default="torch")
+    parser.add_argument("--gguf-file", help="GGUF filename inside a remote --model repo (llamacpp backend)")
+    parser.add_argument("--tokenizer-model", default="Qwen/Qwen3.5-4B",
+                        help="Source model whose tokenizer matches the GGUF (llamacpp backend)")
+    parser.add_argument("--tokenizer-revision", default="851bf6e806efd8d0a36b00ddf55e13ccb7b8cd0a")
+    parser.add_argument("--n-gpu-layers", type=int, default=-1,
+                        help="Layers to offload for llamacpp; -1 is all, 0 is CPU only")
     parser.add_argument("--mlx-bits", type=int, choices=(4, 8), help="Quantize MLX weights in memory; default preserves source precision")
     parser.add_argument("--mlx-cache-limit-mib", type=int,
                         help="MLX inactive allocation cache in MiB (default: 256; 0 disables caching)")
@@ -35,8 +41,12 @@ def main() -> None:
             parser.error("--mlx-cache-limit-mib requires --backend mlx")
         if args.mlx_cache_limit_mib < 0:
             parser.error("--mlx-cache-limit-mib must be nonnegative")
-    if args.backend == "mlx" and args.mode == "reranker":
-        parser.error("MLX supports direct, serial, and shared modes; reranker requires torch")
+    if args.backend != "llamacpp" and args.gguf_file:
+        parser.error("--gguf-file requires --backend llamacpp")
+    if args.n_gpu_layers < -1:
+        parser.error("--n-gpu-layers must be -1 or nonnegative")
+    if args.backend in ("mlx", "llamacpp") and args.mode == "reranker":
+        parser.error(f"{args.backend} supports direct, serial, and shared modes; reranker requires torch")
     rows = [json.loads(line) for line in args.input.read_text().splitlines() if line.strip()]
     if not rows:
         parser.error("Input is empty")
@@ -51,6 +61,15 @@ def main() -> None:
         model, tokenizer, metadata = mlx_backend.load_model(
             args.model, args.revision, args.mlx_bits, cache_limit_mib=cache_limit_mib)
         direct, serial, shared = mlx_backend.score, mlx_backend.SerialPrefixScorer, mlx_backend.score_shared
+    elif args.backend == "llamacpp":
+        from . import llamacpp_backend
+
+        model, tokenizer, metadata = llamacpp_backend.load_model(
+            args.model, args.revision, gguf_file=args.gguf_file,
+            tokenizer_source=args.tokenizer_model, tokenizer_revision=args.tokenizer_revision,
+            n_gpu_layers=args.n_gpu_layers, n_ctx=args.max_tokens)
+        direct, serial, shared = (llamacpp_backend.score, llamacpp_backend.SerialPrefixScorer,
+                                  llamacpp_backend.score_shared)
     else:
         model, tokenizer, metadata = load_causal_model(args.model, args.revision)
     args.output.parent.mkdir(parents=True, exist_ok=True)
